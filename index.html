@@ -144,7 +144,7 @@ function render(){
  if(p=="reading")h=`<div class="card"><h2>Read the text, then answer</h2><div class="text">${READ_TXT}</div>${mcq(R)}<button class="btn" id="nx">Next part</button></div>`;
  if(p=="listening")h=`<div class="card"><h2>Listen, then answer</h2><p class="note">If no sound plays, check that your volume is on.</p>${A.map((a,i)=>`<div class="q"><button class="btn g" data-a="${i}">▶ Play audio ${i+1} (2 plays)</button>${mcq(a.qs)}</div>`).join("")}<button class="btn" id="nx">Next part</button></div>`;
  if(p=="writing")h=`<div class="card"><h2>Write 3 to 5 sentences</h2><p>Say your name, your job, where you work, and one thing you do in your free time. (Maximum 60 words)</p><textarea id="wr">${esc(S.w)}</textarea><p class="note" id="wc">0 / 60 words</p><button class="btn" id="nx">Next part</button></div>`;
- if(p=="speaking")h=`<div class="card"><h2>Introduce yourself</h2><p>You have 15 seconds to prepare. Then speak for 30 to 45 seconds.</p><p class="note">Your speech will be turned into text and sent to your teacher. You can also listen to and download your recording.</p><button class="btn g" id="rc">Start</button> <button class="btn" id="st" disabled>Stop recording</button><p class="note" id="rs"></p><p class="note" id="live"></p><audio id="pl" controls hidden></audio><br><a class="btn" id="dl" hidden download>Download recording</a><div class="text" id="tr" hidden></div><textarea id="alt" hidden placeholder="Your microphone is not available. Type your introduction here."></textarea><br><button class="btn" id="nx">Finish test</button></div>`;
+ if(p=="speaking")h=`<div class="card"><h2>Introduce yourself</h2><p>You have 15 seconds to prepare. Then speak for 30 to 45 seconds.</p><p class="note">Your speech will be recorded, turned into text, and sent to your teacher. You can listen to and download your recording.</p><button class="btn g" id="rc">Start</button> <button class="btn" id="st" disabled>Stop recording</button><p class="note" id="rs"></p><audio id="pl" controls hidden></audio><br><a class="btn" id="dl" hidden download>Download recording</a><div class="text" id="tr" hidden></div><textarea id="alt" hidden placeholder="Your microphone is not available. Type your introduction here."></textarea><br><button class="btn" id="nx">Finish test</button></div>`;
  app.innerHTML=bar()+h;
  S.t=setInterval(()=>{S.left--;const e=document.getElementById("tm");if(e)e.textContent=fmt(Math.max(S.left,0));if(S.left<=0)next()},1000);
  document.getElementById("nx").onclick=next;
@@ -154,26 +154,46 @@ function render(){
  if(wr){const up=()=>{let w=wr.value.trim().split(/\s+/).filter(Boolean);if(w.length>60){wr.value=w.slice(0,60).join(" ");w=w.slice(0,60)}S.w=wr.value;document.getElementById("wc").textContent=w.length+" / 60 words"};wr.oninput=up;up()}
  if(p=="speaking")setupSpeak();
 }
+let _transcriber=null,_modelPromise=null;
+function loadModel(){
+ if(_transcriber)return Promise.resolve(_transcriber);
+ if(_modelPromise)return _modelPromise;
+ _modelPromise=(async()=>{
+  const m=await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2/+esm");
+  _transcriber=await m.pipeline("automatic-speech-recognition","Xenova/whisper-tiny.en");
+  return _transcriber;
+ })().catch(e=>{_modelPromise=null;throw e;});
+ return _modelPromise;
+}
+function resample16k(data,rate){
+ if(rate===16000)return data;
+ const ratio=rate/16000,outLen=Math.round(data.length/ratio),out=new Float32Array(outLen);
+ for(let i=0;i<outLen;i++){const pos=i*ratio,i0=pos|0,i1=i0+1<data.length?i0+1:i0,f=pos-i0;out[i]=data[i0]*(1-f)+data[i1]*f;}
+ return out;
+}
+function pcmToWav(pcm,rate){
+ const n=pcm.length,buf=new ArrayBuffer(44+n*2),v=new DataView(buf);
+ const ws=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
+ ws(0,"RIFF");v.setUint32(4,36+n*2,true);ws(8,"WAVE");ws(12,"fmt ");
+ v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+ v.setUint32(24,rate,true);v.setUint32(28,rate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
+ ws(36,"data");v.setUint32(40,n*2,true);
+ let o=44;for(let i=0;i<n;i++){let s=pcm[i];s=s<-1?-1:(s>1?1:s);v.setInt16(o,s<0?s*0x8000:s*0x7FFF,true);o+=2;}
+ return new Blob([buf],{type:"audio/wav"});
+}
 function setupSpeak(){
  const rc=document.getElementById("rc"),st=document.getElementById("st"),rs=document.getElementById("rs"),
-       live=document.getElementById("live"),tr=document.getElementById("tr"),dl=document.getElementById("dl"),alt=document.getElementById("alt"),nx=document.getElementById("nx");
- const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
- let rec=null,stream=null,ac=null,enc=null,proc=null,mp3=[],mr=null,chunks=[],finished=false;
- const stopRec=()=>{if(rec){try{rec.stop()}catch(e){}}};
+       tr=document.getElementById("tr"),dl=document.getElementById("dl"),alt=document.getElementById("alt"),nx=document.getElementById("nx");
+ let stream=null,ac=null,enc=null,proc=null,mp3=[],pcm=[],rate=0,finished=false;
+ loadModel().catch(()=>{});
  const finalize=(blob,ext)=>{if(finished)return;finished=true;
   if(stream){try{stream.getTracks().forEach(t=>t.stop())}catch(e){}}stream=null;
   if(ac){try{ac.close()}catch(e){}}ac=null;
   const pl=document.getElementById("pl");if(pl&&blob&&blob.size>0){const url=URL.createObjectURL(blob);pl.src=url;pl.hidden=false;dl.href=url;dl.setAttribute("download","speaking-"+S.name.replace(/\s+/g,"_")+"."+ext);dl.hidden=false;}
-  S.rec=true;rs.textContent="Recording saved. You can listen to it or download it.";st.disabled=true;
-  if(tr){tr.hidden=false;tr.textContent=S.speech||"(no speech detected)";}};
- const typeFallback=()=>{alt.hidden=false;alt.oninput=e=>S.speech=e.target.value;rs.textContent="Type your answer in the box below.";rc.disabled=true;live.hidden=true};
- const stopMp3=()=>{stopRec();
-  if(proc){try{proc.disconnect()}catch(e){};proc.onaudioprocess=null;proc=null;}
-  if(enc){try{const f=enc.flush();if(f.length>0)mp3.push(new Int8Array(f));}catch(e){}enc=null;}
-  finalize(new Blob(mp3,{type:"audio/mp3"}),"mp3");mp3=[];};
- const stopAll=()=>{stopRec();
+  S.rec=true;st.disabled=true;};
+ const typeFallback=()=>{alt.hidden=false;alt.oninput=e=>S.speech=e.target.value;rs.textContent="Type your answer in the box below.";rc.disabled=true};
+ const stopAll=()=>{
   if(proc){try{proc.disconnect()}catch(e){}}proc=null;
-  if(mr&&mr.state=="recording"){try{mr.stop()}catch(e){}}
   if(stream){try{stream.getTracks().forEach(t=>t.stop())}catch(e){}}stream=null;
   if(ac){try{ac.close()}catch(e){}}ac=null;};
  S.cleanup=stopAll;
@@ -181,33 +201,45 @@ function setupSpeak(){
  rc.onclick=async()=>{
   rc.disabled=true;let n=15;rs.textContent="Get ready… "+n;
   try{stream=await navigator.mediaDevices.getUserMedia({audio:true});}catch(e){return typeFallback();}
-  if(SR){try{
-    rec=new SR();rec.continuous=true;rec.interimResults=true;rec.lang="en-US";
-    let finalText="";
-    rec.onresult=e=>{let interim="";for(let i=e.resultIndex;i<e.results.length;i++){const r=e.results[i];if(r.isFinal){finalText+=r[0].transcript+" ";}else{interim+=r[0].transcript;}}S.speech=finalText.trim();live.textContent="You said: "+(finalText+interim).trim();};
-    rec.onerror=()=>{};rec.onend=()=>{};
-  }catch(e){rec=null;}}
   const c=setInterval(()=>{n--;rs.textContent="Get ready… "+n;if(n<=0){clearInterval(c);startCap();}},1000);
  };
  function startCap(){
-  if(window.lamejs){
-   ac=new (window.AudioContext||window.webkitAudioContext)();
-   const src=ac.createMediaStreamSource(stream);
-   proc=ac.createScriptProcessor(4096,1,1);
-   enc=new lamejs.Mp3Encoder(1,ac.sampleRate,128);mp3=[];
-   proc.onaudioprocess=e=>{const b=e.inputBuffer.getChannelData(0);const i16=new Int16Array(b.length);for(let i=0;i<b.length;i++){let s=b[i];s=s<-1?-1:(s>1?1:s);i16[i]=s<0?s*0x8000:s*0x7FFF;}const d=enc.encodeBuffer(i16);if(d.length>0)mp3.push(new Int8Array(d));};
-   src.connect(proc);proc.connect(ac.destination);
-   st.onclick=stopMp3;
-   setTimeout(()=>{if(proc)stopMp3();},45000);
-  }else{
-   chunks=[];mr=new MediaRecorder(stream);mr.ondataavailable=e=>chunks.push(e.data);
-   mr.onstop=()=>{const mt=mr.mimeType||"audio/webm";finalize(new Blob(chunks,{type:mt}),(mt.indexOf("mp4")>=0?"m4a":"webm"));};
-   mr.start();
-   st.onclick=()=>{stopRec();mr.stop();};
-   setTimeout(()=>{if(mr&&mr.state=="recording"){stopRec();mr.stop();}},45000);
-  }
-  if(rec){try{rec.start()}catch(e){}}
+  ac=new (window.AudioContext||window.webkitAudioContext)();rate=ac.sampleRate;
+  const src=ac.createMediaStreamSource(stream);
+  proc=ac.createScriptProcessor(4096,1,1);
+  if(window.lamejs){enc=new lamejs.Mp3Encoder(1,rate,128);}mp3=[];pcm=[];
+  proc.onaudioprocess=e=>{const b=e.inputBuffer.getChannelData(0);const c=new Float32Array(b.length);c.set(b);pcm.push(c);
+   if(enc){const i16=new Int16Array(b.length);for(let i=0;i<b.length;i++){let s=b[i];s=s<-1?-1:(s>1?1:s);i16[i]=s<0?s*0x8000:s*0x7FFF;}const d=enc.encodeBuffer(i16);if(d.length>0)mp3.push(new Int8Array(d));}};
+  src.connect(proc);proc.connect(ac.destination);
   st.disabled=false;rs.textContent="Recording… speak now (45 seconds maximum)";
+  st.onclick=stopCap;
+  setTimeout(()=>{if(proc)stopCap();},45000);
+ }
+ function stopCap(){
+  if(finished)return;
+  if(proc){try{proc.disconnect()}catch(e){};proc.onaudioprocess=null;proc=null;}
+  let total=0;for(let i=0;i<pcm.length;i++)total+=pcm[i].length;
+  const full=new Float32Array(total);let o=0;for(let i=0;i<pcm.length;i++){full.set(pcm[i],o);o+=pcm[i].length;}pcm=[];
+  let blob,ext;
+  if(enc){try{const f=enc.flush();if(f.length>0)mp3.push(new Int8Array(f));}catch(e){}blob=new Blob(mp3,{type:"audio/mp3"});ext="mp3";mp3=[];enc=null;}
+  else{blob=pcmToWav(full,rate);ext="wav";}
+  finalize(blob,ext);
+  transcribe(full);
+ }
+ async function transcribe(full){
+  if(!full||full.length<rate*0.3){S.speech="";if(tr){tr.hidden=false;tr.textContent="(no speech detected)";}rs.textContent="Done. You can listen to or download your recording, or press Finish test.";return;}
+  rs.textContent=_transcriber?"Transcribing your speech…":"Loading speech recognition (first time only)…";
+  try{
+   const t=await loadModel();
+   rs.textContent="Transcribing your speech…";
+   const out=await t(resample16k(full,rate));
+   S.speech=(out&&out.text?out.text:"").trim();
+   if(tr){tr.hidden=false;tr.textContent=S.speech||"(no speech detected)";}
+   rs.textContent="Done. You can listen to or download your recording, or press Finish test.";
+  }catch(e){
+   rs.textContent="Automatic transcription unavailable — please type your answer below.";
+   if(alt){alt.hidden=false;alt.oninput=ev=>S.speech=ev.target.value;}
+  }
  }
 }
 render();
